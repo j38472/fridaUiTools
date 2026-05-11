@@ -3,7 +3,7 @@ import os
 
 from PyQt5 import QtCore, QtWidgets
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QColor, QFont
+from PyQt5.QtGui import QColor, QFont, QKeySequence, QTextDocument
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtWidgets import QDialog, QMessageBox
 
@@ -35,9 +35,11 @@ class aiScriptTunerForm(QDialog):
         self.pendingUpdatedScriptText = ""
         self.lastAppliedScriptText = ""
         self.windowStateRestored = False
+        self.scriptSearchLastText = ""
         self._buildUi()
         self.setupScriptEditor()
         self._connectSignals()
+        self._setupShortcuts()
         self.refreshTranslations()
 
     def _buildUi(self):
@@ -74,9 +76,17 @@ class aiScriptTunerForm(QDialog):
         self.topActionLayout.setSpacing(6)
         self.btnLoadCurrentLog = QtWidgets.QPushButton(self)
         self.btnClearLog = QtWidgets.QPushButton(self)
+        self.btnAiTune = QtWidgets.QPushButton(self)
+        self.btnApplyChanges = QtWidgets.QPushButton(self)
+        self.btnUndoChanges = QtWidgets.QPushButton(self)
+        self.btnSaveScript = QtWidgets.QPushButton(self)
         self.topActionLayout.addWidget(self.btnLoadCurrentLog)
         self.topActionLayout.addWidget(self.btnClearLog)
         self.topActionLayout.addStretch(1)
+        self.topActionLayout.addWidget(self.btnAiTune)
+        self.topActionLayout.addWidget(self.btnApplyChanges)
+        self.topActionLayout.addWidget(self.btnUndoChanges)
+        self.topActionLayout.addWidget(self.btnSaveScript)
         self.mainLayout.addLayout(self.topActionLayout)
 
         self.contentSplitter = QtWidgets.QSplitter(Qt.Horizontal, self)
@@ -94,6 +104,18 @@ class aiScriptTunerForm(QDialog):
         self.labScriptEditor = QtWidgets.QLabel(self.scriptPanel)
         self.scriptHeaderLayout.addWidget(self.labScriptEditor)
         self.scriptHeaderLayout.addStretch(1)
+        self.txtScriptSearch = QtWidgets.QLineEdit(self.scriptPanel)
+        self.txtScriptSearch.setClearButtonEnabled(True)
+        self.txtScriptSearch.setMinimumWidth(180)
+        self.btnScriptSearchPrev = QtWidgets.QPushButton(self.scriptPanel)
+        self.btnScriptSearchNext = QtWidgets.QPushButton(self.scriptPanel)
+        self.labScriptSearchStatus = QtWidgets.QLabel(self.scriptPanel)
+        self.labScriptSearchStatus.setMinimumWidth(110)
+        self.labScriptSearchStatus.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.scriptHeaderLayout.addWidget(self.txtScriptSearch)
+        self.scriptHeaderLayout.addWidget(self.btnScriptSearchPrev)
+        self.scriptHeaderLayout.addWidget(self.btnScriptSearchNext)
+        self.scriptHeaderLayout.addWidget(self.labScriptSearchStatus)
         self.scriptPanelLayout.addLayout(self.scriptHeaderLayout)
         self.txtScript = QtWidgets.QPlainTextEdit(self.scriptPanel)
         self.txtScript.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
@@ -127,19 +149,6 @@ class aiScriptTunerForm(QDialog):
         self.contentSplitter.setStretchFactor(1, 5)
         self.contentSplitter.setSizes([620, 460])
 
-        self.actionLayout = QtWidgets.QHBoxLayout()
-        self.actionLayout.setContentsMargins(0, 0, 0, 0)
-        self.actionLayout.setSpacing(6)
-        self.btnAiTune = QtWidgets.QPushButton(self)
-        self.btnApplyChanges = QtWidgets.QPushButton(self)
-        self.btnUndoChanges = QtWidgets.QPushButton(self)
-        self.btnSaveScript = QtWidgets.QPushButton(self)
-        self.actionLayout.addWidget(self.btnAiTune)
-        self.actionLayout.addWidget(self.btnApplyChanges)
-        self.actionLayout.addWidget(self.btnUndoChanges)
-        self.actionLayout.addWidget(self.btnSaveScript)
-        self.mainLayout.addLayout(self.actionLayout)
-
     def _connectSignals(self):
         self.cmbScript.currentIndexChanged.connect(self.onScriptSelectionChanged)
         self.btnReloadScript.clicked.connect(self.reloadCurrentScript)
@@ -149,6 +158,18 @@ class aiScriptTunerForm(QDialog):
         self.btnApplyChanges.clicked.connect(self.applyPendingChanges)
         self.btnUndoChanges.clicked.connect(self.undoLastAppliedChanges)
         self.btnSaveScript.clicked.connect(self.saveCurrentScript)
+        self.txtScriptSearch.returnPressed.connect(self.findNextInScript)
+        self.txtScriptSearch.textChanged.connect(self.onScriptSearchTextChanged)
+        self.btnScriptSearchPrev.clicked.connect(self.findPreviousInScript)
+        self.btnScriptSearchNext.clicked.connect(self.findNextInScript)
+
+    def _setupShortcuts(self):
+        self.shortcutFind = QtWidgets.QShortcut(QKeySequence.Find, self)
+        self.shortcutFind.activated.connect(self.focusScriptSearch)
+        self.shortcutFindNext = QtWidgets.QShortcut(QKeySequence(Qt.Key_F3), self)
+        self.shortcutFindNext.activated.connect(self.findNextInScript)
+        self.shortcutFindPrevious = QtWidgets.QShortcut(QKeySequence("Shift+F3"), self)
+        self.shortcutFindPrevious.activated.connect(self.findPreviousInScript)
 
     def isEnglish(self):
         parent = self.parent()
@@ -305,6 +326,71 @@ class aiScriptTunerForm(QDialog):
             return self.txtScript.text()
         return self.txtScript.toPlainText()
 
+    def focusScriptSearch(self):
+        self.txtScriptSearch.setFocus()
+        self.txtScriptSearch.selectAll()
+
+    def onScriptSearchTextChanged(self):
+        self.scriptSearchLastText = ""
+        self.setScriptSearchStatus("")
+
+    def setScriptSearchStatus(self, message):
+        self.labScriptSearchStatus.setText(message or "")
+
+    def findNextInScript(self):
+        self.findInScript(forward=True)
+
+    def findPreviousInScript(self):
+        self.findInScript(forward=False)
+
+    def findInScript(self, forward=True):
+        keyword = self.txtScriptSearch.text()
+        if not keyword:
+            self.setScriptSearchStatus(self.trText("请输入查找内容", "Enter text to find"))
+            self.focusScriptSearch()
+            return False
+        found = self._findInScriptEditor(keyword, forward=forward)
+        self.scriptSearchLastText = keyword if found else ""
+        if found:
+            self.setScriptSearchStatus(self.trText("已定位", "Found"))
+        else:
+            self.setScriptSearchStatus(self.trText("未找到", "Not found"))
+        return found
+
+    def _findInScriptEditor(self, keyword, forward=True):
+        if getattr(self, "scriptEditorUsesQsci", False):
+            return self._findInQsciScriptEditor(keyword, forward=forward)
+        return self._findInPlainScriptEditor(keyword, forward=forward)
+
+    def _findInPlainScriptEditor(self, keyword, forward=True):
+        options = QTextDocument.FindFlags()
+        if not forward:
+            options |= QTextDocument.FindBackward
+        found = self.txtScript.find(keyword, options)
+        if found:
+            return True
+        cursor = self.txtScript.textCursor()
+        if forward:
+            cursor.movePosition(cursor.Start)
+        else:
+            cursor.movePosition(cursor.End)
+        self.txtScript.setTextCursor(cursor)
+        return self.txtScript.find(keyword, options)
+
+    def _findInQsciScriptEditor(self, keyword, forward=True):
+        start_line, start_index = self.txtScript.getCursorPosition()
+        if self.txtScript.hasSelectedText():
+            line_from, index_from, line_to, index_to = self.txtScript.getSelection()
+            if forward:
+                start_line, start_index = line_to, index_to
+            else:
+                start_line, start_index = line_from, index_from
+        found = self.txtScript.findFirst(keyword, False, False, False, False, forward, start_line, start_index, True)
+        if found:
+            return True
+        line, index = (0, 0) if forward else (-1, -1)
+        return self.txtScript.findFirst(keyword, False, False, False, False, forward, line, index, True)
+
     def refreshTranslations(self):
         self.labScript.setText(self.trText("目标脚本：", "Target script:"))
         self.labScriptEditor.setText(self.trText("脚本内容", "Script content"))
@@ -318,6 +404,9 @@ class aiScriptTunerForm(QDialog):
         self.btnApplyChanges.setText(self.trText("应用修改", "Apply"))
         self.btnUndoChanges.setText(self.trText("撤销本次", "Undo"))
         self.btnSaveScript.setText(self.trText("保存脚本", "Save"))
+        self.txtScriptSearch.setPlaceholderText(self.trText("查找脚本内容", "Find in script"))
+        self.btnScriptSearchPrev.setText(self.trText("上一个", "Previous"))
+        self.btnScriptSearchNext.setText(self.trText("下一个", "Next"))
         if getattr(self, "scriptEditorUsesQsci", False):
             self.txtScript.setToolTip(self.trText("这里展示目标脚本内容。AI 返回局部修改后，会直接替换这里的对应片段。", "The target script is shown here. When AI returns partial edits, the matching fragments are replaced here directly."))
         else:
@@ -443,6 +532,7 @@ class aiScriptTunerForm(QDialog):
         self.pendingUpdatedScriptText = ""
         self.lastAppliedScriptText = ""
         self.scriptEditorSetText(content)
+        self.setScriptSearchStatus("")
         self.txtResult.clear()
         self.saveLastSelectedScriptFile(file_name)
         self.updateActionStates()

@@ -40,6 +40,7 @@ from forms.ZenTracer import zenTracerForm
 from ui.kmain import Ui_MainWindow
 from utils import LogUtil, CmdUtil, FileUtil, GumTraceUtil
 from utils.AiUtil import AiService, AiWorker, FileDownloadWorker, AdbPushWorker, AdbPullWorker, CommandWorker
+from utils.LogUtil import sanitize_ansi_text
 import json, os, threading, frida
 import platform
 import shutil
@@ -120,6 +121,82 @@ FRIDA_FALLBACK_VERSION_CATALOG = {
 
 conf=IniConfig()
 ACTIVE_TRANSLATORS = []
+
+
+class DumpSoWorker(QtCore.QThread):
+    success = QtCore.pyqtSignal(dict)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, api, keyword, parent=None):
+        super(DumpSoWorker, self).__init__(parent)
+        self.api = api
+        self.keyword = (keyword or "").strip()
+
+    def _sanitizeDumpStem(self, text):
+        stem = re.sub(r"[^0-9A-Za-z._-]+", "_", str(text or "").strip())
+        stem = stem.strip("._")
+        if len(stem) <= 0:
+            return "memory_range"
+        return stem[:80]
+
+    def run(self):
+        try:
+            if len(self.keyword) <= 0:
+                raise RuntimeError("empty dump target")
+            module_info = self.api.findmodule(self.keyword)
+            if module_info is not None:
+                base = module_info["base"]
+                size = module_info["size"]
+                module_buffer = self.api.dumpmodule(self.keyword)
+                if module_buffer == -1 or module_buffer is None:
+                    raise RuntimeError("module dump failed")
+                dump_so_name = self.keyword + ".dump.so"
+                with open(dump_so_name, "wb") as f:
+                    f.write(module_buffer)
+                arch = self.api.arch()
+                fix_so_name = CmdUtil.fix_so(arch, self.keyword, dump_so_name, base, size)
+                if os.path.exists(dump_so_name):
+                    os.remove(dump_so_name)
+                self.success.emit({
+                    "kind": "module",
+                    "input": self.keyword,
+                    "output": fix_so_name,
+                    "base": base,
+                    "size": size,
+                })
+                return
+            finder = getattr(self.api, "findrangebymapskeyword", None)
+            if callable(finder) is False:
+                raise RuntimeError("findrangebymapskeyword rpc unavailable")
+            range_info = finder(self.keyword)
+            if not range_info:
+                raise RuntimeError("未找到匹配的模块或匿名内存段")
+            if isinstance(range_info, dict) and range_info.get("error"):
+                raise RuntimeError(str(range_info.get("error")))
+            base = str(range_info.get("base") or "").strip()
+            size = int(range_info.get("size") or 0)
+            maps_line = str(range_info.get("line") or "").strip()
+            label = str(range_info.get("name") or range_info.get("path") or self.keyword).strip()
+            if len(base) <= 0 or size <= 0:
+                raise RuntimeError("匿名内存段信息无效")
+            dump_buffer = self.api.dumprange(base, size)
+            if dump_buffer == -1 or dump_buffer is None:
+                raise RuntimeError("匿名内存段导出失败")
+            file_stem = self._sanitizeDumpStem(label)
+            dump_file_name = "anon_%s_%s_%s.dump.bin" % (file_stem, base.replace("0x", ""), size)
+            with open(dump_file_name, "wb") as f:
+                f.write(dump_buffer)
+            self.success.emit({
+                "kind": "range",
+                "input": self.keyword,
+                "output": dump_file_name,
+                "base": base,
+                "size": size,
+                "line": maps_line,
+                "label": label,
+            })
+        except Exception as ex:
+            self.failed.emit(str(ex))
 
 
 class PinnedTemplateCheckBox(QtWidgets.QCheckBox):
@@ -3379,11 +3456,13 @@ class kmainForm(QMainWindow, Ui_MainWindow):
 
     # 打印操作日志
     def log(self, logstr):
+        logstr = sanitize_ansi_text(logstr)
         datestr = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S   ')
         self.txtLogs.appendPlainText(datestr + logstr)
 
     # 打印输出日志
     def outlog(self, logstr):
+        logstr = sanitize_ansi_text(logstr)
         datestr = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S   ')
         line = datestr + logstr
         self.liveOutputLogBuffer.append(line)
@@ -5067,22 +5146,61 @@ class kmainForm(QMainWindow, Ui_MainWindow):
         res = self.dumpSoForm.exec()
         if res == 0:
             return
-        soName=self.dumpSoForm.moduleName
-        module_info = self.th.default_api.findmodule(soName)
-        print(module_info)
-        base = module_info["base"]
-        size = module_info["size"]
-        module_buffer = self.th.default_api.dumpmodule(soName)
-        if module_buffer != -1:
-            dump_so_name = soName + ".dump.so"
-            with open(dump_so_name, "wb") as f:
-                f.write(module_buffer)
-                f.close()
-                arch = self.th.default_api.arch()
-                fix_so_name = CmdUtil.fix_so(arch, soName, dump_so_name, base, size)
-                self.outlog(fix_so_name)
-                os.remove(dump_so_name)
-                QMessageBox().information(self, "hint",self._translate("kmainForm", f"dump {soName} 成功"))
+        soName = self.dumpSoForm.moduleName.strip()
+        if len(soName) <= 0:
+            return
+        if getattr(self, "dumpSoWorker", None) is not None and self.dumpSoWorker.isRunning():
+            QMessageBox().information(self, "hint", self._translate("kmainForm", "已有 dump 任务在执行，请稍候"))
+            return
+        self.dumpSoProgress = QProgressDialog(self)
+        self.dumpSoProgress.setWindowTitle("dump so")
+        self.dumpSoProgress.setLabelText(self._translate("kmainForm", "正在导出目标内存，这期间主窗口可继续响应。"))
+        self.dumpSoProgress.setRange(0, 0)
+        self.dumpSoProgress.setCancelButton(None)
+        self.dumpSoProgress.setAutoClose(False)
+        self.dumpSoProgress.setAutoReset(False)
+        self.dumpSoProgress.show()
+        self.dumpSoWorker = DumpSoWorker(self.th.default_api, soName, self)
+        self.dumpSoWorker.success.connect(self.onDumpSoSuccess)
+        self.dumpSoWorker.failed.connect(self.onDumpSoFailed)
+        self.dumpSoWorker.finished.connect(self.onDumpSoFinished)
+        self.dumpSoWorker.start()
+
+    def onDumpSoSuccess(self, result):
+        result_kind = result.get("kind", "")
+        output_path = result.get("output", "")
+        if result_kind == "module":
+            self.outlog(output_path)
+            QMessageBox().information(self, "hint", self._translate("kmainForm", "dump %s 成功") % result.get("input", ""))
+            return
+        maps_line = result.get("line", "")
+        if maps_line:
+            self.log(self._translate("kmainForm", "maps命中: ") + maps_line)
+        self.outlog(output_path)
+        QMessageBox().information(
+            self,
+            "hint",
+            self._translate("kmainForm", "dump 匿名内存段成功: ") + output_path,
+        )
+
+    def onDumpSoFailed(self, error_text):
+        self.log(self._translate("kmainForm", "Error:dump失败: ") + error_text)
+        QMessageBox().information(
+            self,
+            "hint",
+            self._translate("kmainForm", "dump失败: ") + error_text + "\n" +
+            self._translate("kmainForm", "请输入模块名、maps 标签或落在该 range 内的地址，例如 libfoo.so、anon:1f91、7c5e304000"),
+        )
+
+    def onDumpSoFinished(self):
+        if getattr(self, "dumpSoProgress", None) is not None:
+            self.dumpSoProgress.close()
+            self.dumpSoProgress.deleteLater()
+            self.dumpSoProgress = None
+        worker = getattr(self, "dumpSoWorker", None)
+        if worker is not None:
+            worker.deleteLater()
+            self.dumpSoWorker = None
 
     def dumpFart(self):
         if self.isattach() == False:

@@ -1520,13 +1520,212 @@ rpc.exports.findmodule=function(so_name) {
     var libso = Process.findModuleByName(so_name);
     return libso;
 }
+
+function parseProcMapsLine(line) {
+    if (!line) {
+        return null;
+    }
+    var match = /^([0-9a-fA-F]+)-([0-9a-fA-F]+)\s+([rwxps-]{4})\s+([0-9a-fA-F]+)\s+([0-9a-fA-F:]+)\s+(\d+)\s*(.*)$/.exec(line);
+    if (!match) {
+        return null;
+    }
+    var start = ptr("0x" + match[1]);
+    var end = ptr("0x" + match[2]);
+    var pathOrLabel = (match[7] || "").trim();
+    return {
+        base: start.toString(),
+        end: end.toString(),
+        size: parseInt(match[2], 16) - parseInt(match[1], 16),
+        protection: match[3],
+        offset: "0x" + match[4],
+        device: match[5],
+        inode: parseInt(match[6], 10),
+        path: pathOrLabel,
+        name: pathOrLabel,
+        line: line
+    };
+}
+
+function readProcMapsTextWithJava() {
+    if (typeof Java === "undefined" || !Java.available) {
+        return "";
+    }
+    var content = "";
+    try {
+        Java.performNow(function () {
+            var fis = null;
+            var bos = null;
+            try {
+                var FileInputStream = Java.use("java.io.FileInputStream");
+                var ByteArrayOutputStream = Java.use("java.io.ByteArrayOutputStream");
+                var StringCls = Java.use("java.lang.String");
+                var Charset = null;
+                try {
+                    Charset = Java.use("java.nio.charset.Charset");
+                } catch (charsetError) {
+                    Charset = null;
+                }
+                fis = FileInputStream.$new("/proc/self/maps");
+                bos = ByteArrayOutputStream.$new();
+                var buf = Java.array("byte", new Array(4096).fill(0));
+                var len = 0;
+                while ((len = fis.read(buf)) !== -1) {
+                    bos.write(buf, 0, len);
+                }
+                if (Charset !== null) {
+                    content = StringCls.$new(bos.toByteArray(), Charset.forName("UTF-8")).toString();
+                } else {
+                    content = StringCls.$new(bos.toByteArray(), "UTF-8").toString();
+                }
+            } catch (e) {
+                content = "";
+            } finally {
+                if (fis) {
+                    try {
+                        fis.close();
+                    } catch (closeFisError) {
+                    }
+                }
+                if (bos) {
+                    try {
+                        bos.close();
+                    } catch (closeBosError) {
+                    }
+                }
+            }
+        });
+    } catch (outerError) {
+        return "";
+    }
+    return content;
+}
+
+function readProcMapsText() {
+    var file = null;
+    try {
+        file = new File("/proc/self/maps", "r");
+        var parts = [];
+        var line = null;
+        while ((line = file.readLine()) !== null) {
+            parts.push(line);
+        }
+        var text = parts.join("\n");
+        if (text.length > 0) {
+            return text;
+        }
+    } catch (e) {
+    } finally {
+        if (file) {
+            try {
+                file.close();
+            } catch (closeError) {
+            }
+        }
+    }
+    return readProcMapsTextWithJava();
+}
+
+function isKeywordAddressMatch(parsed, keyword) {
+    if (!parsed || !keyword || !/^[0-9a-f]+$/i.test(keyword)) {
+        return false;
+    }
+    try {
+        var targetValue = parseInt(keyword, 16);
+        var startValue = parseInt(parsed.base, 16);
+        var endValue = parseInt(parsed.end, 16);
+        if (isNaN(targetValue) || isNaN(startValue) || isNaN(endValue)) {
+            return false;
+        }
+        return targetValue >= startValue && targetValue < endValue;
+    } catch (e) {
+        return false;
+    }
+}
+
+function findRangeByMapsKeyword(keyword) {
+    var normalizedKeyword = (keyword || "").toString().trim().toLowerCase();
+    if (!normalizedKeyword) {
+        return null;
+    }
+    try {
+        var mapsText = readProcMapsText();
+        if (mapsText && mapsText.length > 0) {
+            var lines = mapsText.split(/\r?\n/);
+            for (var i = 0; i < lines.length; i++) {
+                var line = lines[i];
+                if (!line) {
+                    continue;
+                }
+                var parsed = parseProcMapsLine(line);
+                if (!parsed || parsed.size <= 0) {
+                    continue;
+                }
+                if (line.toLowerCase().indexOf(normalizedKeyword) >= 0 || isKeywordAddressMatch(parsed, normalizedKeyword)) {
+                    return parsed;
+                }
+            }
+        }
+        var ranges = Process.enumerateRanges("---");
+        for (var index = 0; index < ranges.length; index++) {
+            var rangeInfo = ranges[index];
+            var normalized = normalizeRangeDetails(rangeInfo);
+            if (!normalized || !normalized.base || !normalized.size) {
+                continue;
+            }
+            var candidateText = [
+                normalized.base,
+                normalized.filePath || "",
+                normalized.moduleName || "",
+                rangeInfo.protection || ""
+            ].join(" ").toLowerCase();
+            if (candidateText.indexOf(normalizedKeyword) >= 0) {
+                return normalized;
+            }
+            var synthetic = {
+                base: normalized.base,
+                end: ptr(normalized.base).add(normalized.size).toString(),
+                size: normalized.size
+            };
+            if (isKeywordAddressMatch(synthetic, normalizedKeyword)) {
+                return normalized;
+            }
+        }
+    } catch (e) {
+        return {
+            error: e.toString(),
+            keyword: keyword
+        };
+    }
+    return null;
+}
+
+function dumpMemoryRange(base, size) {
+    var rangeSize = parseInt(size || 0);
+    if (rangeSize <= 0) {
+        return -1;
+    }
+    var rangeBase = ptr(base);
+    try {
+        Memory.protect(rangeBase, rangeSize, "rwx");
+    } catch (protectError) {
+    }
+    return rangeBase.readByteArray(rangeSize);
+}
+
+rpc.exports.findrangebymapskeyword=function(keyword) {
+    return findRangeByMapsKeyword(keyword);
+}
+
+rpc.exports.dumprange=function(base, size) {
+    return dumpMemoryRange(base, size);
+}
+
 rpc.exports.dumpmodule= function(so_name) {
     var libso = Process.findModuleByName(so_name);
     if (libso == null) {
         return -1;
     }
-    Memory.protect(ptr(libso.base), libso.size, 'rwx');
-    var libso_buffer = ptr(libso.base).readByteArray(libso.size);
+    var libso_buffer = dumpMemoryRange(libso.base, libso.size);
     libso.buffer = libso_buffer;
     return libso_buffer;
 }
