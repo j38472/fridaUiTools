@@ -4188,42 +4188,71 @@ class kmainForm(QMainWindow, Ui_MainWindow):
             self.log(output)
         return proc.returncode, output
 
-    def adbShellCommandAttempts(self, script_text, prefer_root=False):
-        script_text = shlex.quote(script_text)
+    def adbShellScriptAttempts(self, script_text, prefer_root=True):
+        quoted_script = shlex.quote(script_text)
         root_attempts = [
-            (["shell", "su", "-c", script_text], 'adb shell su -c %s' % script_text),
-            (["shell", "su", "0", "sh", "-c", script_text], 'adb shell su 0 sh -c %s' % script_text),
+            (["shell", "su", "-c", quoted_script], 'adb shell su -c "%s"' % script_text),
+            (["shell", "su", "0", "sh", "-c", quoted_script], 'adb shell su 0 sh -c "%s"' % script_text),
         ]
-        normal_attempt = [(["shell", "sh", "-c", script_text], 'adb shell sh -c %s' % script_text)]
-        return (root_attempts + normal_attempt) if prefer_root else (normal_attempt + root_attempts)
+        shell_attempt = (["shell", "sh", "-c", quoted_script], 'adb shell sh -c "%s"' % script_text)
+        if prefer_root:
+            return root_attempts + [shell_attempt]
+        return [shell_attempt] + root_attempts
 
-    def shouldTryNextShellAttempt(self, output, return_code, is_last):
-        if is_last or return_code == 0:
+    def shouldRetryAdbShellAttempt(self, output, return_code, is_last):
+        if is_last:
             return False
         lower_output = (output or "").lower()
-        return (
-            "su: inaccessible or not found" in lower_output
-            or "su: not found" in lower_output
-            or "invalid uid/gid" in lower_output
-            or "permission denied" in lower_output
-            or return_code != 0
+        retry_markers = (
+            "su: inaccessible or not found",
+            "su: not found",
+            "invalid uid/gid",
+            "unknown id",
+            "permission denied",
+            "inaccessible or not found",
         )
+        if any(marker in lower_output for marker in retry_markers):
+            return True
+        return return_code != 0
 
-    def runAdbShellScript(self, script_text, timeout=20, log_command=True, log_output=True, prefer_root=False):
-        attempts = self.adbShellCommandAttempts(script_text, prefer_root=prefer_root)
-        last_result = (1, "")
+    def runAdbShellScriptWithFallback(self, script_text, timeout=20, log_command=True, log_output=True, prefer_root=True):
+        attempts = self.adbShellScriptAttempts(script_text, prefer_root=prefer_root)
+        last_output = ""
+        last_nonempty_output = ""
+        last_return_code = 0
         for index, (extra_args, command_text) in enumerate(attempts):
-            rc, output = self.runAdbCommand(
+            if log_command:
+                self.log("Run command: " + command_text)
+            return_code, output = self.runAdbCommand(
                 extra_args,
                 timeout=timeout,
-                log_command=log_command,
-                log_output=log_output,
+                log_command=False,
+                log_output=False,
             )
-            last_result = (rc, output)
-            if self.shouldTryNextShellAttempt(output, rc, index == len(attempts) - 1):
+            output = (output or "").strip()
+            if output:
+                last_nonempty_output = output
+            last_output = output
+            last_return_code = return_code
+            if self.shouldRetryAdbShellAttempt(output, return_code, index == len(attempts) - 1):
                 continue
-            return rc, output
-        return last_result
+            final_output = output or last_nonempty_output
+            if log_output and final_output:
+                self.log(final_output)
+            return return_code, final_output
+        final_output = last_output or last_nonempty_output
+        if log_output and final_output:
+            self.log(final_output)
+        return last_return_code, final_output
+
+    def runAdbShellScript(self, script_text, timeout=20, log_command=True, log_output=True, prefer_root=False):
+        return self.runAdbShellScriptWithFallback(
+            script_text,
+            timeout=timeout,
+            log_command=log_command,
+            log_output=log_output,
+            prefer_root=prefer_root,
+        )
 
     def fridaLaunchParts(self, name):
         launch_parts = ["/data/local/tmp/" + name]
@@ -4309,18 +4338,18 @@ class kmainForm(QMainWindow, Ui_MainWindow):
         self.log(self.trText("准备启动 frida-server...", "Preparing to start frida-server..."))
 
         kill_cmd = "killall %s %s frida-server 2>/dev/null || true" % (self.fridaName or "frida-server", name)
-        self.runAdbShellScript(kill_cmd, timeout=8, log_command=False, log_output=False, prefer_root=True)
+        self.runAdbShellScriptWithFallback(kill_cmd, timeout=8, log_command=False, log_output=False, prefer_root=True)
 
         chmod_targets = ["/data/local/tmp/" + name]
         if self.fridaName:
             chmod_targets.insert(0, "/data/local/tmp/" + self.fridaName)
         chmod_cmd = "; ".join("chmod 0777 %s 2>/dev/null" % target for target in chmod_targets)
-        self.runAdbShellScript(chmod_cmd, timeout=8, log_command=False, log_output=False, prefer_root=True)
+        self.runAdbShellScriptWithFallback(chmod_cmd, timeout=8, log_command=False, log_output=False, prefer_root=True)
 
         self.prepareFridaForward()
 
         remote_launch = "nohup %s >/data/local/tmp/frida_start.log 2>&1 &" % " ".join(shlex.quote(part) for part in launch_parts)
-        rc, output = self.runAdbShellScript(remote_launch, timeout=8, prefer_root=True)
+        rc, output = self.runAdbShellScriptWithFallback(remote_launch, timeout=8, prefer_root=True)
         if rc != 0:
             raise RuntimeError(self.trText("启动 frida-server 失败：", "Failed to start frida-server: ") + output)
 
