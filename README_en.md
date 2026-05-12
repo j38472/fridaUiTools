@@ -68,12 +68,6 @@ apikey = your_api_key
 model = gpt-5.4
 ```
 
-Notes:
-
-- If `host`, `apikey`, or `model` is missing, AI script generation and AI log analysis are disabled automatically
-- `config/ai.local.ini` should stay in your personal ignore list and should not be committed
-- `host` supports OpenAI-compatible API endpoints
-
 ## Thanks
 
 * [jnitrace](https://github.com/chame1eon/jnitrace)

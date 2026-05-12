@@ -18,6 +18,7 @@ import urllib.request
 from forms import SelectPackage
 from forms.AntiFrida import antiFridaForm
 from forms.CallFunction import callFunctionForm
+from forms.AiScriptTuner import aiScriptTunerForm
 from forms.Custom import customForm
 from forms.DumpAddress import dumpAddressForm
 from forms.AiSettings import aiSettingsForm
@@ -38,15 +39,62 @@ from forms.Wifi import wifiForm
 from forms.ZenTracer import zenTracerForm
 from ui.kmain import Ui_MainWindow
 from utils import LogUtil, CmdUtil, FileUtil, GumTraceUtil
-from utils.AiUtil import AiService, AiWorker, FileDownloadWorker, AdbPushWorker, CommandWorker
+from utils.AiUtil import AiService, AiWorker, FileDownloadWorker, AdbPushWorker, AdbPullWorker, CommandWorker
+from utils.LogUtil import sanitize_ansi_text
 import json, os, threading, frida
 import platform
 import shutil
 import subprocess
 import tempfile
+import zipfile
 
 import TraceThread
 from utils.IniUtil import IniConfig
+
+
+def resolve_app_root():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def resolve_bundle_root():
+    if getattr(sys, "frozen", False):
+        meipass_root = getattr(sys, "_MEIPASS", "")
+        if meipass_root:
+            return os.path.abspath(meipass_root)
+        return os.path.join(resolve_app_root(), "_internal")
+    return resolve_app_root()
+
+
+def sync_runtime_resource_dir(directory_name):
+    source_dir = os.path.join(BUNDLE_ROOT, directory_name)
+    target_dir = os.path.join(APP_ROOT, directory_name)
+    if os.path.isdir(source_dir) is False:
+        return
+    if os.path.exists(target_dir) is False:
+        shutil.copytree(source_dir, target_dir)
+        return
+    for current_root, _, file_names in os.walk(source_dir):
+        relative_root = os.path.relpath(current_root, source_dir)
+        target_root = target_dir if relative_root == "." else os.path.join(target_dir, relative_root)
+        os.makedirs(target_root, exist_ok=True)
+        for file_name in file_names:
+            source_file = os.path.join(current_root, file_name)
+            target_file = os.path.join(target_root, file_name)
+            if os.path.exists(target_file) is False:
+                shutil.copy2(source_file, target_file)
+
+
+def bootstrap_runtime_resources():
+    for directory_name in ("config", "custom", "exec", "js", "lib", "sh"):
+        sync_runtime_resource_dir(directory_name)
+
+
+APP_ROOT = resolve_app_root()
+BUNDLE_ROOT = resolve_bundle_root()
+bootstrap_runtime_resources()
+os.chdir(APP_ROOT)
 
 FRIDA_ARCH_FAMILIES = {
     "arm64": ["arm", "arm64"],
@@ -61,7 +109,7 @@ FRIDA_LOCAL_ARCH_TO_FAMILY = {
 }
 FRIDA_SUPPORTED_MAJORS = [14, 15, 16]
 FRIDA_MENU_VERSION_LIMIT = 3
-FRIDA_RELEASE_CACHE_PATH = os.path.join(".", "config", "frida_versions.json")
+FRIDA_RELEASE_CACHE_PATH = os.path.join(APP_ROOT, "config", "frida_versions.json")
 FRIDA_RELEASE_TAGS_API_URL = "https://api.github.com/repos/frida/frida/tags?per_page=100&page={page}"
 FRIDA_RELEASE_TAGS_PAGES = 4
 FRIDA_EMPTY_RELEASE_CATALOG = {major: [] for major in FRIDA_SUPPORTED_MAJORS}
@@ -73,6 +121,82 @@ FRIDA_FALLBACK_VERSION_CATALOG = {
 
 conf=IniConfig()
 ACTIVE_TRANSLATORS = []
+
+
+class DumpSoWorker(QtCore.QThread):
+    success = QtCore.pyqtSignal(dict)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, api, keyword, parent=None):
+        super(DumpSoWorker, self).__init__(parent)
+        self.api = api
+        self.keyword = (keyword or "").strip()
+
+    def _sanitizeDumpStem(self, text):
+        stem = re.sub(r"[^0-9A-Za-z._-]+", "_", str(text or "").strip())
+        stem = stem.strip("._")
+        if len(stem) <= 0:
+            return "memory_range"
+        return stem[:80]
+
+    def run(self):
+        try:
+            if len(self.keyword) <= 0:
+                raise RuntimeError("empty dump target")
+            module_info = self.api.findmodule(self.keyword)
+            if module_info is not None:
+                base = module_info["base"]
+                size = module_info["size"]
+                module_buffer = self.api.dumpmodule(self.keyword)
+                if module_buffer == -1 or module_buffer is None:
+                    raise RuntimeError("module dump failed")
+                dump_so_name = self.keyword + ".dump.so"
+                with open(dump_so_name, "wb") as f:
+                    f.write(module_buffer)
+                arch = self.api.arch()
+                fix_so_name = CmdUtil.fix_so(arch, self.keyword, dump_so_name, base, size)
+                if os.path.exists(dump_so_name):
+                    os.remove(dump_so_name)
+                self.success.emit({
+                    "kind": "module",
+                    "input": self.keyword,
+                    "output": fix_so_name,
+                    "base": base,
+                    "size": size,
+                })
+                return
+            finder = getattr(self.api, "findrangebymapskeyword", None)
+            if callable(finder) is False:
+                raise RuntimeError("findrangebymapskeyword rpc unavailable")
+            range_info = finder(self.keyword)
+            if not range_info:
+                raise RuntimeError("未找到匹配的模块或匿名内存段")
+            if isinstance(range_info, dict) and range_info.get("error"):
+                raise RuntimeError(str(range_info.get("error")))
+            base = str(range_info.get("base") or "").strip()
+            size = int(range_info.get("size") or 0)
+            maps_line = str(range_info.get("line") or "").strip()
+            label = str(range_info.get("name") or range_info.get("path") or self.keyword).strip()
+            if len(base) <= 0 or size <= 0:
+                raise RuntimeError("匿名内存段信息无效")
+            dump_buffer = self.api.dumprange(base, size)
+            if dump_buffer == -1 or dump_buffer is None:
+                raise RuntimeError("匿名内存段导出失败")
+            file_stem = self._sanitizeDumpStem(label)
+            dump_file_name = "anon_%s_%s_%s.dump.bin" % (file_stem, base.replace("0x", ""), size)
+            with open(dump_file_name, "wb") as f:
+                f.write(dump_buffer)
+            self.success.emit({
+                "kind": "range",
+                "input": self.keyword,
+                "output": dump_file_name,
+                "base": base,
+                "size": size,
+                "line": maps_line,
+                "label": label,
+            })
+        except Exception as ex:
+            self.failed.emit(str(ex))
 
 
 class PinnedTemplateCheckBox(QtWidgets.QCheckBox):
@@ -164,6 +288,8 @@ class kmainForm(QMainWindow, Ui_MainWindow):
         self.fridaDownloadDialog = None
         self.fridaUploadWorker = None
         self.fridaUploadDialog = None
+        self.apkDownloadWorker = None
+        self.apkDownloadDialog = None
         self.fridaVersionWorker = None
         self.fridaVersionDialog = None
         self.fridaVersionOutput = None
@@ -182,6 +308,7 @@ class kmainForm(QMainWindow, Ui_MainWindow):
         self.loadedLogContent = ""
         self.language = conf.read("kmain", "language") or "China"
         self.currentAppInfoSnapshot = {}
+        self.mainContextForegroundPackage = ""
         self.attachedAppInfoSnapshot = {}
         self.hooksData = {}
         self.initUi()
@@ -395,6 +522,8 @@ class kmainForm(QMainWindow, Ui_MainWindow):
         self.fartForm = fartForm()
         self.wallBreakerForm = wallBreakerForm()
         self.customForm = customForm(self)
+        self.aiScriptTunerForm = aiScriptTunerForm(self)
+        self.aiScriptTunerForm.setParent(None)
         self.callFunctionForm = callFunctionForm()
         self.fartBinForm = fartBinForm()
         self.stalkerMatchForm = stalkerMatchForm()
@@ -513,6 +642,7 @@ class kmainForm(QMainWindow, Ui_MainWindow):
         self.applyWorkbenchTheme()
         if self.styleSheet():
             self.customForm.setStyleSheet(self.styleSheet())
+            self.aiScriptTunerForm.setStyleSheet(self.styleSheet())
         self.customForm.setWindowFlags(self.customForm.windowFlags() | Qt.WindowMinMaxButtonsHint)
         self.retranslateDynamicUi()
         self.refreshDeviceList()
@@ -590,6 +720,18 @@ class kmainForm(QMainWindow, Ui_MainWindow):
         if hasattr(self, "btnMainContextPortSettings"):
             self.btnMainContextPortSettings.setText(self.currentConnectionSettingsActionText())
             self.fitButtonTextWidth(self.btnMainContextPortSettings)
+        if hasattr(self, "txtMainContextForegroundPackage"):
+            attached_package = (self.labPackage.text().strip() if hasattr(self, "labPackage") else "")
+            if len(attached_package) > 0:
+                display_text = attached_package
+                placeholder = self.trText("当前已附加包名", "Attached package")
+            else:
+                display_text = self.trText("未附加进程", "No process attached")
+                placeholder = display_text
+            self.txtMainContextForegroundPackage.setPlaceholderText(placeholder)
+            self.txtMainContextForegroundPackage.setText(display_text)
+            self.txtMainContextForegroundPackage.setToolTip(display_text if len(display_text) > 0 else placeholder)
+            self.txtMainContextForegroundPackage.setCursorPosition(0)
 
     def updateConnectionSelectionUi(self):
         current_conn_type = getattr(self, "connType", "usb")
@@ -614,6 +756,8 @@ class kmainForm(QMainWindow, Ui_MainWindow):
         self.updateToolbarContextPanel()
 
     def currentFridaVersionDisplay(self):
+        if not self.listLocalFridaInventory():
+            return ""
         for action in getattr(self, "fridaVersionMenuActions", []):
             version = str(action.data() or "").strip()
             if action.isChecked() and version:
@@ -763,7 +907,7 @@ class kmainForm(QMainWindow, Ui_MainWindow):
             placeholder = QAction(self.trText("请先下载并上传 frida", "Download and upload frida first"), self)
             placeholder.setEnabled(False)
             self.menufrida.addAction(placeholder)
-            self.updateFridaVersionSelectionUi(installed_version)
+            self.updateFridaVersionSelectionUi("")
             return
         self.verGroup = QActionGroup(self)
         self.verGroup.setExclusive(True)
@@ -933,6 +1077,47 @@ class kmainForm(QMainWindow, Ui_MainWindow):
             return self.cmbDevices.currentText().strip()
         return self.selectedDeviceSerial()
 
+    def currentAppSnapshotForSelectedDevice(self):
+        snapshot = self.currentAppInfoSnapshot or {}
+        if len(snapshot) <= 0:
+            return {}
+        snapshot_serial = (snapshot.get("deviceSerial") or "").strip()
+        current_serial = self.selectedDeviceSerial()
+        if snapshot_serial and current_serial and snapshot_serial != current_serial:
+            return {}
+        return snapshot
+
+    def setMainContextForegroundPackage(self, package_name):
+        self.mainContextForegroundPackage = (package_name or "").strip()
+
+    def readForegroundPackageNameSilently(self):
+        if len(self.selectedDeviceSerial()) <= 0:
+            return ""
+        try:
+            res = CmdUtil.exec("adb shell dumpsys window")
+        except Exception:
+            return ""
+        m1 = re.search("mCurrentFocus=Window\\{(.+?)\\}", res)
+        if m1 is None:
+            return ""
+        m1sp = m1.group(1).split(" ")
+        if len(m1sp) < 3:
+            return ""
+        focus_entry = m1sp[2].strip()
+        if focus_entry == "StatusBar":
+            return ""
+        focus_parts = focus_entry.split("/")
+        if len(focus_parts) < 2:
+            return ""
+        return focus_parts[0].strip()
+
+    def refreshMainContextForegroundPackage(self):
+        snapshot = self.currentAppSnapshotForSelectedDevice()
+        if snapshot:
+            self.setMainContextForegroundPackage(snapshot.get("packageName"))
+            return
+        self.setMainContextForegroundPackage(self.readForegroundPackageNameSilently())
+
     def updateSelectedDevice(self, serial):
         self.selectedDeviceId = (serial or "").strip()
         if self.selectedDeviceId:
@@ -977,6 +1162,10 @@ class kmainForm(QMainWindow, Ui_MainWindow):
         if hasattr(self, "cmbMainContextDevices"):
             self.populateDeviceCombo(self.cmbMainContextDevices, devices, target)
         self.updateSelectedDevice(target)
+        snapshot_serial = ((self.currentAppInfoSnapshot or {}).get("deviceSerial") or "").strip()
+        if len(target) <= 0 or (snapshot_serial and snapshot_serial != target):
+            self.currentAppInfoSnapshot = {}
+        self.refreshMainContextForegroundPackage()
         if hasattr(self, "labDeviceStatus"):
             if target:
                 self.labDeviceStatus.setText(self.trText("当前设备：", "Current device: ") + target)
@@ -1003,6 +1192,10 @@ class kmainForm(QMainWindow, Ui_MainWindow):
                 combo.setCurrentIndex(index)
             combo.blockSignals(False)
         self.updateSelectedDevice(current)
+        snapshot_serial = ((self.currentAppInfoSnapshot or {}).get("deviceSerial") or "").strip()
+        if len(current) <= 0 or (snapshot_serial and snapshot_serial != current):
+            self.currentAppInfoSnapshot = {}
+        self.refreshMainContextForegroundPackage()
         if hasattr(self, "labDeviceStatus"):
             self.labDeviceStatus.setText((self.trText("当前设备：", "Current device: ") + current) if current else self.trText("当前设备：未检测到已连接设备", "Current device: no connected device detected"))
         self.updateToolbarContextPanel()
@@ -1019,7 +1212,7 @@ class kmainForm(QMainWindow, Ui_MainWindow):
         self.activateWindow()
 
     def loadTypeData(self):
-        typePath = "./config/type_en.json" if self.isEnglish() else "./config/type.json"
+        typePath = os.path.join(APP_ROOT, "config", "type_en.json" if self.isEnglish() else "type.json")
         with open(typePath, "r", encoding="utf8") as typeFile:
             self.typeData = json.loads(typeFile.read())
 
@@ -1132,7 +1325,7 @@ class kmainForm(QMainWindow, Ui_MainWindow):
         self.setupInfoTable(self.attachInfoTable)
 
     def buildCurrentAppInfoRows(self):
-        data = self.currentAppInfoSnapshot or {}
+        data = self.currentAppSnapshotForSelectedDevice()
         if len(data) <= 0:
             return []
         return [
@@ -1978,9 +2171,11 @@ class kmainForm(QMainWindow, Ui_MainWindow):
         self.btnOpenLogFile = QtWidgets.QPushButton(self._translate("kmainForm", "打开日志文件"))
         self.btnRestoreLiveLog = QtWidgets.QPushButton(self._translate("kmainForm", "恢复实时日志"))
         self.btnAnalyzeLog = QtWidgets.QPushButton(self._translate("kmainForm", "AI 分析日志"))
+        self.btnAiTuneScript = QtWidgets.QPushButton(self._translate("kmainForm", "AI 微调脚本"))
         self.aiAnalysisToolbar.addWidget(self.btnOpenLogFile)
         self.aiAnalysisToolbar.addWidget(self.btnRestoreLiveLog)
         self.aiAnalysisToolbar.addWidget(self.btnAnalyzeLog)
+        self.aiAnalysisToolbar.addWidget(self.btnAiTuneScript)
         self.aiAnalysisLayout.addLayout(self.aiAnalysisToolbar)
 
         self.aiAnalysisSplitter = QtWidgets.QSplitter(Qt.Vertical, self.aiAnalysisTab)
@@ -2009,7 +2204,7 @@ class kmainForm(QMainWindow, Ui_MainWindow):
         self.gridLayout_2.removeWidget(self.txtoutLogs)
         self.gridLayout_2.addWidget(self.txtoutLogs, 1, 0, 1, 1)
 
-        for button in [self.btnOpenLogFile, self.btnRestoreLiveLog, self.btnAnalyzeLog]:
+        for button in [self.btnOpenLogFile, self.btnRestoreLiveLog, self.btnAnalyzeLog, self.btnAiTuneScript]:
             button.setCursor(Qt.PointingHandCursor)
             button.setMinimumHeight(38)
         self.txtAiLogInput.setPlaceholderText(self._translate("kmainForm", "打开日志文件，或直接粘贴 / 输入待分析日志..."))
@@ -2017,6 +2212,7 @@ class kmainForm(QMainWindow, Ui_MainWindow):
         self.btnOpenLogFile.clicked.connect(self.openLogFile)
         self.btnRestoreLiveLog.clicked.connect(self.restoreLiveLog)
         self.btnAnalyzeLog.clicked.connect(self.analyzeLogWithAi)
+        self.btnAiTuneScript.clicked.connect(self.openAiScriptTuner)
 
     def initSettingsMenu(self):
         self.actionAiSettings = QAction(self._translate("kmainForm", "AI 设置"), self)
@@ -2068,6 +2264,12 @@ class kmainForm(QMainWindow, Ui_MainWindow):
         self.btnMainContextPortSettings.setStyleSheet("padding: 3px 16px 6px 16px;")
         self.btnMainContextPortSettings.setCursor(Qt.PointingHandCursor)
 
+        self.txtMainContextForegroundPackage = QLineEdit(self.mainContextGroup)
+        self.txtMainContextForegroundPackage.setReadOnly(True)
+        self.txtMainContextForegroundPackage.setMinimumWidth(220)
+        self.txtMainContextForegroundPackage.setFixedHeight(control_height)
+        self.txtMainContextForegroundPackage.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+
         for widget in [
             self.labMainContextDeviceTitle,
             self.cmbMainContextDevices,
@@ -2075,9 +2277,10 @@ class kmainForm(QMainWindow, Ui_MainWindow):
             self.txtMainContextPortValue,
             self.btnMainContextRefreshDevices,
             self.btnMainContextPortSettings,
+            self.txtMainContextForegroundPackage,
         ]:
-            self.mainContextLayout.addWidget(widget)
-        self.mainContextLayout.addStretch(1)
+            stretch = 1 if widget is self.txtMainContextForegroundPackage else 0
+            self.mainContextLayout.addWidget(widget, stretch)
         self.updateToolbarContextPanel()
 
     def fitButtonTextWidth(self, button, padding=16):
@@ -3055,6 +3258,51 @@ class kmainForm(QMainWindow, Ui_MainWindow):
             return self.loadedLogContent
         return "\n".join(self.liveOutputLogBuffer)
 
+    def currentLogTextForAiTuner(self):
+        if self.currentLogMode == "file" and (self.loadedLogContent or "").strip():
+            return self.loadedLogContent
+        live_output = self.txtoutLogs.toPlainText() if hasattr(self, "txtoutLogs") else ""
+        if live_output.strip():
+            return live_output
+        operation_log = self.txtLogs.toPlainText() if hasattr(self, "txtLogs") else ""
+        if operation_log.strip():
+            return operation_log
+        return self.currentLogText()
+
+    def preferredAiTuneScriptFile(self):
+        if hasattr(self, "aiScriptTunerForm"):
+            remembered_file = self.aiScriptTunerForm.lastSelectedScriptFile()
+            if remembered_file:
+                return remembered_file
+        if hasattr(self, "customForm") and self.customForm.customHooks:
+            file_name = self.customForm.customHooks[0].get("fileName", "")
+            if file_name:
+                return file_name
+        if hasattr(self, "customForm") and self.customForm.customs:
+            file_name = self.customForm.customs[0].get("fileName", "")
+            if file_name:
+                return file_name
+        return ""
+
+    def openAiScriptTuner(self):
+        self.customForm.initData()
+        if len(self.customForm.customs) <= 0:
+            QMessageBox().information(self, "hint", self.trText("当前没有可微调的自定义脚本，请先在“自定义”中创建或导入脚本。", "There are no custom scripts to tune yet. Create or import one in 'Custom' first."))
+            return
+        preferred_file = self.preferredAiTuneScriptFile()
+        self.aiScriptTunerForm.refreshTranslations()
+        self.aiScriptTunerForm.openWithScript(preferred_file)
+
+    def saveAiTunedScript(self, file_name, script_text):
+        self.customForm.initData()
+        data = self.customForm.scriptDataByFileName(file_name)
+        if data is None:
+            raise RuntimeError(self.trText("未找到要保存的脚本：", "Target script was not found: ") + file_name)
+        add_to_hook = any(item.get("fileName") == file_name for item in self.customForm.customHooks)
+        save_path = self.customForm.upsertCustomScript(dict(data), script_text, add_to_hook=add_to_hook, show_message=False)
+        self.syncCustomHooksToMain()
+        return save_path
+
     def openLogFile(self):
         filepath = QFileDialog.getOpenFileName(self, self.trText("打开日志文件", "Open log file"), "./logs", "Log Files (*.txt *.log);;All Files (*)")
         if not filepath[0]:
@@ -3208,11 +3456,13 @@ class kmainForm(QMainWindow, Ui_MainWindow):
 
     # 打印操作日志
     def log(self, logstr):
+        logstr = sanitize_ansi_text(logstr)
         datestr = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S   ')
         self.txtLogs.appendPlainText(datestr + logstr)
 
     # 打印输出日志
     def outlog(self, logstr):
+        logstr = sanitize_ansi_text(logstr)
         datestr = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S   ')
         line = datestr + logstr
         self.liveOutputLogBuffer.append(line)
@@ -3497,6 +3747,107 @@ class kmainForm(QMainWindow, Ui_MainWindow):
             self.fridaUploadWorker.deleteLater()
             self.fridaUploadWorker = None
 
+    def updateApkDownloadProgress(self, value, total):
+        if self.apkDownloadDialog is None:
+            return
+        if total > 0:
+            if self.apkDownloadDialog.maximum() != total:
+                self.apkDownloadDialog.setRange(0, total)
+            self.apkDownloadDialog.setValue(min(value, total))
+        else:
+            self.apkDownloadDialog.setRange(0, 0)
+        QApplication.processEvents()
+
+    def updateApkDownloadStatus(self, text):
+        if self.apkDownloadDialog is None or not text:
+            return
+        if self.apkDownloadDialog.maximum() != 0:
+            self.apkDownloadDialog.setRange(0, 0)
+        self.apkDownloadDialog.setLabelText(text)
+        QApplication.processEvents()
+
+    def cleanupApkDownloadWorker(self):
+        if self.apkDownloadDialog is not None:
+            self.apkDownloadDialog.close()
+            self.apkDownloadDialog.deleteLater()
+            self.apkDownloadDialog = None
+        if self.apkDownloadWorker is not None:
+            self.apkDownloadWorker.wait()
+            self.apkDownloadWorker.deleteLater()
+            self.apkDownloadWorker = None
+
+    def createXapkArchive(self, apk_files, xapk_path):
+        with zipfile.ZipFile(xapk_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for apk_file in apk_files:
+                archive.write(apk_file, arcname=os.path.basename(apk_file))
+
+    def pullSingleApkWithProgress(self, remote_path, output_path, package_name, current_index=0, total_files=1):
+        self.apkDownloadDialog = QProgressDialog(self)
+        self.apkDownloadDialog.setWindowTitle(self.trText("下载当前应用", "Download current app"))
+        self.apkDownloadDialog.setLabelText(
+            self.trText(
+                "正在下载 {package}（{current}/{total}）...",
+                "Downloading {package} ({current}/{total})...",
+            ).format(package=package_name, current=current_index + 1, total=total_files)
+        )
+        self.apkDownloadDialog.setCancelButton(None)
+        self.apkDownloadDialog.setMinimumDuration(0)
+        self.apkDownloadDialog.setAutoClose(False)
+        self.apkDownloadDialog.setAutoReset(False)
+        self.apkDownloadDialog.setWindowModality(Qt.WindowModal)
+        self.apkDownloadDialog.setRange(0, total_files * 100)
+        self.apkDownloadDialog.setValue(current_index * 100)
+        self.apkDownloadDialog.show()
+        QApplication.processEvents()
+
+        command_args = self.adbCommandArgs() + ["pull", remote_path, output_path]
+        loop = QtCore.QEventLoop(self)
+        result = {"path": None, "error": None}
+        self.apkDownloadWorker = AdbPullWorker(command_args, output_path, self)
+        self.apkDownloadWorker.progress.connect(lambda value, total: self.updateApkDownloadProgress((current_index * 100) + value, total_files * 100))
+        self.apkDownloadWorker.status.connect(
+            lambda text: self.updateApkDownloadStatus(
+                self.trText(
+                    "正在下载 {package}（{current}/{total}）...\n{text}",
+                    "Downloading {package} ({current}/{total})...\n{text}",
+                ).format(package=package_name, current=current_index + 1, total=total_files, text=text)
+            )
+        )
+        self.apkDownloadWorker.success.connect(lambda path: result.update({"path": path}))
+        self.apkDownloadWorker.success.connect(loop.quit)
+        self.apkDownloadWorker.error.connect(lambda message: result.update({"error": message}))
+        self.apkDownloadWorker.error.connect(loop.quit)
+        self.apkDownloadWorker.start()
+        loop.exec_()
+        self.cleanupApkDownloadWorker()
+        if result["error"]:
+            raise RuntimeError(result["error"])
+        if not result["path"] or os.path.exists(result["path"]) is False or os.path.getsize(result["path"]) <= 0:
+            raise RuntimeError(self.trText("下载失败，未生成 APK 文件。", "Download failed and no APK file was created."))
+        return result["path"]
+
+    def pullApksWithPackaging(self, apk_paths, package_name):
+        apks_dir = os.path.abspath("./apks")
+        os.makedirs(apks_dir, exist_ok=True)
+        if len(apk_paths) == 1:
+            output_path = os.path.join(apks_dir, "%s.apk" % package_name)
+            return self.pullSingleApkWithProgress(apk_paths[0], output_path, package_name, 0, 1)
+
+        temp_dir = tempfile.mkdtemp(prefix=package_name.replace(".", "_") + "_", dir=apks_dir)
+        downloaded_files = []
+        try:
+            for index, remote_path in enumerate(apk_paths):
+                local_name = os.path.basename(remote_path)
+                local_path = os.path.join(temp_dir, local_name)
+                downloaded_files.append(self.pullSingleApkWithProgress(remote_path, local_path, package_name, index, len(apk_paths)))
+            xapk_path = os.path.join(apks_dir, "%s.xapk" % package_name)
+            self.createXapkArchive(downloaded_files, xapk_path)
+            if os.path.exists(xapk_path) is False or os.path.getsize(xapk_path) <= 0:
+                raise RuntimeError(self.trText("XAPK 打包失败，未生成有效文件。", "Failed to package XAPK: no valid output file was created."))
+            return xapk_path
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
     def pushSingleFridaServer(self, local_path, remote_name, version, arch):
         remote_path = "/data/local/tmp/" + remote_name
         command_args = self.adbCommandArgs() + ["push", local_path, remote_path]
@@ -3695,6 +4046,10 @@ class kmainForm(QMainWindow, Ui_MainWindow):
             self.openGumTraceLogDirectory()
 
     def PullApk(self):
+        selected_serial = self.selectedDeviceSerial()
+        if len(selected_serial) <= 0:
+            QMessageBox().information(self, "hint", self.trText("未检测到已连接设备，无法下载当前应用。", "No connected device detected. Cannot download the current app."))
+            return
         cmdtp = "grep"
         if platform.system() == "Windows":
             cmdtp = "findstr"
@@ -3729,19 +4084,21 @@ class kmainForm(QMainWindow, Ui_MainWindow):
 
         pathRes= CmdUtil.execCmdData("adb shell pm path %s" % packageName)
         pathRes=pathRes.replace("package:","")
+        apk_paths = [path.strip() for path in pathRes.split("\n") if path.strip().endswith(".apk")]
+        if len(apk_paths) <= 0:
+            QMessageBox().information(self, "hint", self.trText("未获取到当前应用的 APK 路径，可能未连接手机或当前前台应用不可用。", "Failed to resolve the APK path for the current app. The device may be disconnected or the foreground app is unavailable."))
+            return
         if os.path.exists("./apks") == False:
             os.makedirs("./apks")
-            
-        for path in pathRes.split("\n"):
-            if "apk" not in path:
-                continue
-            cmd = "adb pull %s ./apks/%s.apk" % (path, packageName)
-            res = CmdUtil.execCmd(cmd)
-            self.log(res)
-        if "error" in res:
-            QMessageBox().information(self, "hint", res)
-        else:
-            QMessageBox().information(self, "hint", packageName +self._translate("kmainForm", ".apk下载成功.输出结果在目录./apks/"))
+        try:
+            output_path = self.pullApksWithPackaging(apk_paths, packageName)
+            apk_dir = os.path.abspath("./apks")
+            output_name = os.path.basename(output_path)
+            QMessageBox().information(self, "hint", packageName + self.trText(". 下载完成：", ". Download completed: ") + output_name + self.trText("，输出结果在目录 ./apks/", ". Output saved to ./apks/"))
+            QDesktopServices.openUrl(QUrl.fromLocalFile(apk_dir))
+            return
+        except Exception as error:
+            QMessageBox().information(self, "hint", str(error))
 
 
     def ReplaceSh(self,rfile,wfile,name):
@@ -3831,13 +4188,42 @@ class kmainForm(QMainWindow, Ui_MainWindow):
             self.log(output)
         return proc.returncode, output
 
-    def runAdbShellScript(self, script_text, timeout=20, log_command=True, log_output=True):
-        return self.runAdbCommand(
-            ["shell", "sh", "-c", shlex.quote(script_text)],
-            timeout=timeout,
-            log_command=log_command,
-            log_output=log_output,
+    def adbShellCommandAttempts(self, script_text, prefer_root=False):
+        script_text = shlex.quote(script_text)
+        root_attempts = [
+            (["shell", "su", "-c", script_text], 'adb shell su -c %s' % script_text),
+            (["shell", "su", "0", "sh", "-c", script_text], 'adb shell su 0 sh -c %s' % script_text),
+        ]
+        normal_attempt = [(["shell", "sh", "-c", script_text], 'adb shell sh -c %s' % script_text)]
+        return (root_attempts + normal_attempt) if prefer_root else (normal_attempt + root_attempts)
+
+    def shouldTryNextShellAttempt(self, output, return_code, is_last):
+        if is_last or return_code == 0:
+            return False
+        lower_output = (output or "").lower()
+        return (
+            "su: inaccessible or not found" in lower_output
+            or "su: not found" in lower_output
+            or "invalid uid/gid" in lower_output
+            or "permission denied" in lower_output
+            or return_code != 0
         )
+
+    def runAdbShellScript(self, script_text, timeout=20, log_command=True, log_output=True, prefer_root=False):
+        attempts = self.adbShellCommandAttempts(script_text, prefer_root=prefer_root)
+        last_result = (1, "")
+        for index, (extra_args, command_text) in enumerate(attempts):
+            rc, output = self.runAdbCommand(
+                extra_args,
+                timeout=timeout,
+                log_command=log_command,
+                log_output=log_output,
+            )
+            last_result = (rc, output)
+            if self.shouldTryNextShellAttempt(output, rc, index == len(attempts) - 1):
+                continue
+            return rc, output
+        return last_result
 
     def fridaLaunchParts(self, name):
         launch_parts = ["/data/local/tmp/" + name]
@@ -3868,6 +4254,7 @@ class kmainForm(QMainWindow, Ui_MainWindow):
             timeout=8,
             log_command=False,
             log_output=False,
+            prefer_root=True,
         )
         return len(output.strip()) > 0
 
@@ -3877,6 +4264,7 @@ class kmainForm(QMainWindow, Ui_MainWindow):
             timeout=8,
             log_command=False,
             log_output=False,
+            prefer_root=True,
         )
         return output.strip()
 
@@ -3921,18 +4309,18 @@ class kmainForm(QMainWindow, Ui_MainWindow):
         self.log(self.trText("准备启动 frida-server...", "Preparing to start frida-server..."))
 
         kill_cmd = "killall %s %s frida-server 2>/dev/null || true" % (self.fridaName or "frida-server", name)
-        self.runAdbShellScript(kill_cmd, timeout=8, log_command=False, log_output=False)
+        self.runAdbShellScript(kill_cmd, timeout=8, log_command=False, log_output=False, prefer_root=True)
 
         chmod_targets = ["/data/local/tmp/" + name]
         if self.fridaName:
             chmod_targets.insert(0, "/data/local/tmp/" + self.fridaName)
         chmod_cmd = "; ".join("chmod 0777 %s 2>/dev/null" % target for target in chmod_targets)
-        self.runAdbShellScript(chmod_cmd, timeout=8, log_command=False, log_output=False)
+        self.runAdbShellScript(chmod_cmd, timeout=8, log_command=False, log_output=False, prefer_root=True)
 
         self.prepareFridaForward()
 
         remote_launch = "nohup %s >/data/local/tmp/frida_start.log 2>&1 &" % " ".join(shlex.quote(part) for part in launch_parts)
-        rc, output = self.runAdbShellScript(remote_launch, timeout=8)
+        rc, output = self.runAdbShellScript(remote_launch, timeout=8, prefer_root=True)
         if rc != 0:
             raise RuntimeError(self.trText("启动 frida-server 失败：", "Failed to start frida-server: ") + output)
 
@@ -3959,9 +4347,24 @@ class kmainForm(QMainWindow, Ui_MainWindow):
         os.makedirs(cache_dir, exist_ok=True)
         return cache_dir
 
+    def currentPythonExecutable(self):
+        if getattr(sys, "frozen", False):
+            return "python3"
+        return sys.executable or "python3"
+
+    def bundledPythonSiteTarget(self):
+        if getattr(sys, "frozen", False):
+            return BUNDLE_ROOT
+        return ""
+
     def getInstalledPythonFridaVersion(self):
         try:
-            command_args = ["python3", "-c", "import frida; print(getattr(frida, '__version__', ''))"]
+            if getattr(sys, "frozen", False):
+                preferred_version = conf.read("kmain", "python_frida_version").strip()
+                if preferred_version:
+                    return preferred_version
+                return getattr(frida, "__version__", "") or ""
+            command_args = [self.currentPythonExecutable(), "-c", "import frida; print(getattr(frida, '__version__', ''))"]
             output = subprocess.check_output(command_args, stderr=subprocess.STDOUT, text=True).strip()
             return output
         except Exception:
@@ -3970,21 +4373,45 @@ class kmainForm(QMainWindow, Ui_MainWindow):
     def buildFridaInstallCommand(self, version):
         cache_dir = self.ensureFridaWheelCacheDir()
         package_spec = f"frida=={version}"
+        python_cmd = self.currentPythonExecutable()
+        target_dir = self.bundledPythonSiteTarget()
         # 仅切换 frida Python 包版本；保留现有 frida-tools。
         # 本地有 wheel 时走纯离线安装；否则允许 pip 访问索引并在需要时从源码构建。
         if self.hasCachedFridaWheel(cache_dir, version):
-            return [
-                "python3", "-m", "pip", "install", "-U",
+            command = [
+                python_cmd, "-m", "pip", "install", "-U",
                 "--no-index",
                 "--find-links", cache_dir,
                 package_spec,
             ]
+        else:
+            command = [
+                python_cmd, "-m", "pip", "install", "-U",
+                "--cache-dir", cache_dir,
+                "--find-links", cache_dir,
+                package_spec,
+            ]
+        if target_dir:
+            command[4:4] = ["--target", target_dir]
+        return command
+
+    def buildFridaWheelDownloadCommand(self, version):
+        cache_dir = self.ensureFridaWheelCacheDir()
         return [
-            "python3", "-m", "pip", "install", "-U",
-            "--cache-dir", cache_dir,
-            "--find-links", cache_dir,
-            package_spec,
+            self.currentPythonExecutable(),
+            "-m",
+            "pip",
+            "download",
+            "--dest",
+            cache_dir,
+            f"frida=={version}",
         ]
+
+    def installPythonFridaVersion(self, version):
+        installed = self.getInstalledPythonFridaVersion()
+        if installed == version:
+            return []
+        return self.buildFridaInstallCommand(version)
 
     def hasCachedFridaWheel(self, cache_dir, version):
         """检查缓存目录中是否存在指定版本可直接安装的 frida wheel"""
@@ -4007,24 +4434,6 @@ class kmainForm(QMainWindow, Ui_MainWindow):
             if f.startswith(source_prefix) and (f.endswith(".tar.gz") or f.endswith(".zip")):
                 return True
         return False
-
-    def buildFridaWheelDownloadCommand(self, version):
-        cache_dir = self.ensureFridaWheelCacheDir()
-        return [
-            "python3",
-            "-m",
-            "pip",
-            "download",
-            "--dest",
-            cache_dir,
-            f"frida=={version}",
-        ]
-
-    def installPythonFridaVersion(self, version):
-        installed = self.getInstalledPythonFridaVersion()
-        if installed == version:
-            return []
-        return self.buildFridaInstallCommand(version)
 
     def appendFridaVersionOutput(self, text):
         if self.fridaVersionOutput is None or not text:
@@ -4082,6 +4491,7 @@ class kmainForm(QMainWindow, Ui_MainWindow):
     def finishFridaVersionChange(self, version, output, warm_cache=True):
         self.cleanupFridaVersionWorker()
         self.curFridaVer = version
+        conf.write("kmain", "python_frida_version", version)
         for action in self.fridaVersionMenuActions:
             action.setChecked(str(action.data() or "").strip() == version)
         self.updateFridaVersionSelectionUi(version)
@@ -4167,7 +4577,7 @@ class kmainForm(QMainWindow, Ui_MainWindow):
                 self.hooksData[key]["bak"] = self.typeData[key].get("bak", self.hooksData[key].get("bak", ""))
 
     def refreshChildTranslations(self):
-        for form in [self.customForm, self.aiSettingsForm]:
+        for form in [self.customForm, self.aiSettingsForm, self.aiScriptTunerForm]:
             if hasattr(form, "refreshTranslations"):
                 form.refreshTranslations()
 
@@ -4217,6 +4627,7 @@ class kmainForm(QMainWindow, Ui_MainWindow):
         self.btnOpenLogFile.setText(self.trText("打开日志文件", "Open log file"))
         self.btnRestoreLiveLog.setText(self.trText("恢复实时日志", "Restore live log"))
         self.btnAnalyzeLog.setText(self.trText("AI 分析日志", "AI analyze log"))
+        self.btnAiTuneScript.setText(self.trText("AI 微调脚本", "AI Script Tuner")) if hasattr(self, "btnAiTuneScript") else None
         self.actionAiSettings.setText(self.trText("AI 设置", "AI Settings"))
         self.tabWidget.setTabText(self.tabWidget.indexOf(self.tab_2), self.trText("主界面", "Main"))
         self.tabWidget.setTabText(self.tabWidget.indexOf(self.tab), self.trText("附加进程信息", "Attach process info"))
@@ -4451,6 +4862,7 @@ class kmainForm(QMainWindow, Ui_MainWindow):
             if name not in packageData:
                 packageFile.write(name + "\n")
         self.labPackage.setText(name)
+        self.updateToolbarContextPanel()
         self.refreshOverviewCards()
 
     def getFridaDevice(self):
@@ -4620,6 +5032,7 @@ class kmainForm(QMainWindow, Ui_MainWindow):
             if hasattr(self, "attachResourceTable"):
                 self.renderAttachResourceRows([])
             self.updateAttachedInfoTable()
+        self.updateToolbarContextPanel()
         self.refreshOverviewCards()
 
     # 根据进程名进行附加进程
@@ -4733,22 +5146,61 @@ class kmainForm(QMainWindow, Ui_MainWindow):
         res = self.dumpSoForm.exec()
         if res == 0:
             return
-        soName=self.dumpSoForm.moduleName
-        module_info = self.th.default_api.findmodule(soName)
-        print(module_info)
-        base = module_info["base"]
-        size = module_info["size"]
-        module_buffer = self.th.default_api.dumpmodule(soName)
-        if module_buffer != -1:
-            dump_so_name = soName + ".dump.so"
-            with open(dump_so_name, "wb") as f:
-                f.write(module_buffer)
-                f.close()
-                arch = self.th.default_api.arch()
-                fix_so_name = CmdUtil.fix_so(arch, soName, dump_so_name, base, size)
-                self.outlog(fix_so_name)
-                os.remove(dump_so_name)
-                QMessageBox().information(self, "hint",self._translate("kmainForm", f"dump {soName} 成功"))
+        soName = self.dumpSoForm.moduleName.strip()
+        if len(soName) <= 0:
+            return
+        if getattr(self, "dumpSoWorker", None) is not None and self.dumpSoWorker.isRunning():
+            QMessageBox().information(self, "hint", self._translate("kmainForm", "已有 dump 任务在执行，请稍候"))
+            return
+        self.dumpSoProgress = QProgressDialog(self)
+        self.dumpSoProgress.setWindowTitle("dump so")
+        self.dumpSoProgress.setLabelText(self._translate("kmainForm", "正在导出目标内存，这期间主窗口可继续响应。"))
+        self.dumpSoProgress.setRange(0, 0)
+        self.dumpSoProgress.setCancelButton(None)
+        self.dumpSoProgress.setAutoClose(False)
+        self.dumpSoProgress.setAutoReset(False)
+        self.dumpSoProgress.show()
+        self.dumpSoWorker = DumpSoWorker(self.th.default_api, soName, self)
+        self.dumpSoWorker.success.connect(self.onDumpSoSuccess)
+        self.dumpSoWorker.failed.connect(self.onDumpSoFailed)
+        self.dumpSoWorker.finished.connect(self.onDumpSoFinished)
+        self.dumpSoWorker.start()
+
+    def onDumpSoSuccess(self, result):
+        result_kind = result.get("kind", "")
+        output_path = result.get("output", "")
+        if result_kind == "module":
+            self.outlog(output_path)
+            QMessageBox().information(self, "hint", self._translate("kmainForm", "dump %s 成功") % result.get("input", ""))
+            return
+        maps_line = result.get("line", "")
+        if maps_line:
+            self.log(self._translate("kmainForm", "maps命中: ") + maps_line)
+        self.outlog(output_path)
+        QMessageBox().information(
+            self,
+            "hint",
+            self._translate("kmainForm", "dump 匿名内存段成功: ") + output_path,
+        )
+
+    def onDumpSoFailed(self, error_text):
+        self.log(self._translate("kmainForm", "Error:dump失败: ") + error_text)
+        QMessageBox().information(
+            self,
+            "hint",
+            self._translate("kmainForm", "dump失败: ") + error_text + "\n" +
+            self._translate("kmainForm", "请输入模块名、maps 标签或落在该 range 内的地址，例如 libfoo.so、anon:1f91、7c5e304000"),
+        )
+
+    def onDumpSoFinished(self):
+        if getattr(self, "dumpSoProgress", None) is not None:
+            self.dumpSoProgress.close()
+            self.dumpSoProgress.deleteLater()
+            self.dumpSoProgress = None
+        worker = getattr(self, "dumpSoWorker", None)
+        if worker is not None:
+            worker.deleteLater()
+            self.dumpSoWorker = None
 
     def dumpFart(self):
         if self.isattach() == False:
@@ -5211,6 +5663,7 @@ class kmainForm(QMainWindow, Ui_MainWindow):
 
     def queryCurrentAppSnapshot(self, packageName, currentFocus, component, pid, baseDir):
         snapshot = {
+            "deviceSerial": self.selectedDeviceSerial(),
             "packageName": packageName,
             "processName": packageName,
             "currentFocus": currentFocus,
@@ -5392,7 +5845,9 @@ class kmainForm(QMainWindow, Ui_MainWindow):
         self.txtComponent.setText(component)
         self.txtBaseDir.setText(baseDir)
         self.currentAppInfoSnapshot = self.queryCurrentAppSnapshot(packageName, currentFocus, component, pid, baseDir)
+        self.setMainContextForegroundPackage(packageName)
         self.updateCurrentAppInfoTable()
+        self.updateToolbarContextPanel()
         self.refreshOverviewCards()
 
     def fartOpBin(self):

@@ -14,9 +14,11 @@ import hashlib
 import os
 
 from utils import CmdUtil
+from utils.LogUtil import sanitize_ansi_text
 
 JAVA_PERFORM_PREFIX = re.compile(r'^\s*Java\.perform\(function\s*\(\)\s*\{', re.S)
 JAVA_PERFORM_SUFFIX = re.compile(r'\}\s*\)\s*;?\s*$', re.S)
+TRACE_DEBUG = os.environ.get("FRIDA_UI_DEBUG", "").lower() in ("1", "true", "yes", "on")
 
 def wrap_java_perform_script(script_text, script_name):
     if not JAVA_PERFORM_PREFIX.match(script_text):
@@ -45,6 +47,13 @@ if (typeof Java !== "undefined" && Java.available) {{
 }})();'''
 
 md5 = lambda bs: hashlib.md5(bs).hexdigest()
+
+
+def debug_print(message):
+    if TRACE_DEBUG:
+        print(sanitize_ansi_text(message))
+
+
 # 继承QThread
 class Runthread(QThread):
     #  通过类成员对象定义信号对象
@@ -109,10 +118,10 @@ class Runthread(QThread):
         self.taskOverSignel.emit()
 
     def log(self,msg):
-        self.loggerSignel.emit(msg)
+        self.loggerSignel.emit(sanitize_ansi_text(msg))
 
     def outlog(self,msg):
-        self.outloggerSignel.emit(msg)
+        self.outloggerSignel.emit(sanitize_ansi_text(msg))
 
     def _attach(self,pname):
         if not self.device:
@@ -401,9 +410,9 @@ class Runthread(QThread):
         elif "class_list" in p:
             self.classListSignel.emit(p["class_list"])
         elif "scanInfoList" in p:
-            self.searchMemorySignel.emit("searchMem",p["scanInfoList"])
+            self.searchMemorySignel.emit("searchMem", sanitize_ansi_text(p["scanInfoList"]))
         elif "scanlog" in p:
-            self.searchMemorySignel.emit("outlog", p["scanlog"])
+            self.searchMemorySignel.emit("outlog", sanitize_ansi_text(p["scanlog"]))
         elif "breakout" in p:
             self.setBreakSignel.emit(p["breakout"])
         self.outlog(str(p["data"]))
@@ -530,26 +539,24 @@ class Runthread(QThread):
 
     def on_message(self,message, data):
         if message["type"] == "error":
-            print("[DEBUG] on_message ERROR: %s" % json.dumps(message)[:300])
+            debug_print("[DEBUG] on_message ERROR: %s" % json.dumps(message)[:300])
             self.outlog(json.dumps(message))
             return
         payload = message.get("payload", {})
-        # 调试：打印所有非 error 消息的 key
         if isinstance(payload, dict):
-            print("[DEBUG] on_message: keys=%s" % list(payload.keys()))
+            debug_print("[DEBUG] on_message: keys=%s" % list(payload.keys()))
         else:
-            print("[DEBUG] on_message: payload type=%s, val=%s" % (type(payload), str(payload)[:200]))
+            debug_print("[DEBUG] on_message: payload type=%s, val=%s" % (type(payload), str(payload)[:200]))
         if "init" in payload:
             self.outlog(payload["init"])
             self.log(payload["init"])
             return
         if "jsname" not in payload:
-            print("[DEBUG] on_message: no jsname, payload=%s" % str(payload)[:200])
+            debug_print("[DEBUG] on_message: no jsname, payload=%s" % str(payload)[:200])
             return
 
-        # 调试：检查 class_list 消息
         if "class_list" in payload:
-            print("[DEBUG] on_message: class_list found, count=%d" % len(payload["class_list"]))
+            debug_print("[DEBUG] on_message: class_list found, count=%d" % len(payload["class_list"]))
 
         if payload["jsname"]=="default":
             self.default_message(payload)

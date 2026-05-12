@@ -111,6 +111,30 @@ venv.bak/
 config/ai.local.ini
 exec/frida-server-*-android-*
 
+# Local IDE / Codex state
+.idea/
+.codex
+
+# Runtime output and captures
+logs/
+pcap/
+tmp/
+*.pcap
+
+# Local APK / XAPK samples
+apks/
+*.apk
+*.xapk
+
+# Local generated analysis artifacts
+custom/ai_sessions.json
+custom/dexpro.js
+custom/find1f91.js
+js/test.js
+*_fix.so
+*.dump.so
+*.dump.bin
+
 # Spyder project settings
 .spyderproject
 .spyproject
