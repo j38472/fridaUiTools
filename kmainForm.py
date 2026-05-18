@@ -122,6 +122,16 @@ FRIDA_FALLBACK_VERSION_CATALOG = {
 conf=IniConfig()
 ACTIVE_TRANSLATORS = []
 
+def get_font_size():
+    """从配置文件获取字体大小"""
+    try:
+        font_size = conf.read("kmain", "font_size")
+        if font_size:
+            return int(font_size)
+    except Exception:
+        pass
+    # 默认值
+    return 8
 
 class DumpSoWorker(QtCore.QThread):
     success = QtCore.pyqtSignal(dict)
@@ -443,6 +453,9 @@ class kmainForm(QMainWindow, Ui_MainWindow):
         self.actionUsb.triggered.connect(self.UsbConn)
         self.actionEnglish.triggered.connect(self.ChangeEnglish)
         self.actionChina.triggered.connect(self.ChangeChina)
+
+        # 字体大小切换
+        self.actionFontSize.triggered.connect(self.ChangeFontSize)
 
         self.actionChangePort.triggered.connect(self.ChangePort)
         self.verGroup = QActionGroup(self)
@@ -4833,6 +4846,48 @@ class kmainForm(QMainWindow, Ui_MainWindow):
             return
         self.switchLanguage("China")
 
+    def ChangeFontSize(self):
+        """打开字体大小选择对话框"""
+        try:
+            # 获取当前字体大小
+            current_size = get_font_size()
+            
+            # 创建输入对话框
+            from PyQt5.QtWidgets import QInputDialog
+            new_size, ok = QInputDialog.getInt(
+                self,
+                self.trText("设置字体大小", "Set Font Size"),
+                self.trText("请输入字体大小 (6-20 pt):", "Enter font size (6-20 pt):"),
+                current_size,  # 默认值
+                6,             # 最小值
+                20,            # 最大值
+                1              # 步长
+            )
+            
+            if ok and new_size != current_size:
+                # 保存到配置文件
+                conf.write("kmain", "font_size", str(new_size))
+                
+                # 重新应用 CSS 样式
+                app = QApplication.instance()
+                if app:
+                    current_style = app.styleSheet()
+                    import re
+                    new_style = re.sub(r'font-size:\s*\d+pt', 'font-size: %dpt' % new_size, current_style)
+                    app.setStyleSheet(new_style)
+                
+                # 显示提示
+                QMessageBox().information(
+                    self, 
+                    "hint", 
+                    self.trText(
+                        "字体大小已更改为 %dpt，重启后完全生效" % new_size,
+                        "Font size changed to %dpt, restart for full effect" % new_size
+                    )
+                )
+        except Exception as ex:
+            self.log(self.trText("更改字体大小异常：", "Failed to change font size: ") + str(ex))
+
     def StartFridaServer(self):
         binary_name = "frida-server"
         if self.fridaName != None and len(self.fridaName) > 0:
@@ -5937,8 +5992,27 @@ if __name__ == "__main__":
     # 抑制 Qt 的 SVG 和样式警告 - 必须在 QApplication 创建之前设置
     os.environ['QT_LOGGING_RULES'] = 'qt.svg=false;*.warning=false'
     
+    # 启用高 DPI 支持 - 必须在 QApplication 创建之前设置
+    # 这解决了高分辨率屏幕下字体和窗口过小的问题
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    
     current_exit_code = 1207
     app = QApplication(sys.argv)
+
+    # 设置高 DPI 缩放策略（Qt 5.14+）
+    if hasattr(Qt, 'AA_DisableWindowContextHelpButton'):
+        app.setAttribute(Qt.AA_DisableWindowContextHelpButton, True)
+    
+    # 设置高 DPI 缩放舍入策略
+    try:
+        from PyQt5.QtCore import Qt
+        app.setHighDpiScaleFactorRoundingPolicy(
+            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+        )
+    except AttributeError:
+        # 旧版本 Qt 不支持此属性
+        pass
     try:
         import logging
         logging.getLogger().setLevel(logging.ERROR)
@@ -5952,6 +6026,9 @@ if __name__ == "__main__":
         })
         # qt-material 不覆盖 checkbox/radio，手动补充，并添加悬浮效果
         app.setStyleSheet(app.styleSheet() + """
+        * {
+            font-size: %spt;
+        }
         QPushButton {
             padding: 8px 16px;
         }
@@ -6006,7 +6083,7 @@ if __name__ == "__main__":
             border-color: #26a69a;
             border-width: 3px;
         }
-        """)
+        """ % get_font_size())
     except ImportError:
         pass
     while current_exit_code == 1207:

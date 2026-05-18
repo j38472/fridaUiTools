@@ -523,5 +523,10 @@
         <source>English</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <location filename="kmain.py" line="638"/>
+        <source>字体大小</source>
+        <translation type="unfinished">Font Size</translation>
+    </message>
 </context>
 </TS>
